@@ -1,0 +1,451 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+#BiocManager::install('multtest')
+#install.packages('metap')
+#BiocManager::install("SingleR")
+#BiocManager::install("celldex")
+#remotes::install_version("Seurat", version="5.0.3")
+#remotes::install_version("SeuratObject", version="5.0.1")
+```
+
+We start by loading all the necessary packages.
+
+```{r warning=FALSE}
+library("remotes")
+require("DropletUtils")
+require("Seurat")
+require("Matrix")
+library("tidyverse")
+library("multtest")
+library("metap")
+library("SingleR")
+library("celldex")
+set.seed(101)
+```
+
+We load the various data contained in the filtered_feature_bc_matrix folder for the different samples. We import the data contained in filtered_feature_bc_matrix because they have already been pre-processed with cell ranger. Import with Read1x and create a seurat object with CreateSeuratObject.
+
+```{r}
+sce_data_I <- Seurat::Read10X(data.dir =   "C:/Users/diaak/LDI/scRNASeq/data/cellranger_counts/cellranger_counts/GEXA/filtered_feature_bc_matrix")
+dim(sce_data_I)
+sce_data_I_obj <- Seurat::CreateSeuratObject(sce_data_I, min.cells=5, min.features=100, project = "GEXA")
+sce_data_II <- Seurat::Read10X(data.dir =   "C:/Users/diaak/LDI/scRNASeq/data/cellranger_counts/cellranger_counts/GEXB/filtered_feature_bc_matrix")
+dim(sce_data_II)
+sce_data_II_obj <- Seurat::CreateSeuratObject(sce_data_II, min.cells=5, min.features=100, project = "GEXB")
+sce_data_III <- Seurat::Read10X(data.dir =   "C:/Users/diaak/LDI/scRNASeq/data/cellranger_counts/cellranger_counts/GEXC/filtered_feature_bc_matrix")
+dim(sce_data_III)
+sce_data_III_obj <- Seurat::CreateSeuratObject(sce_data_III, min.cells=5, min.features=100, project = "GEXC")
+sce_data_IV <- Seurat::Read10X(data.dir =   "C:/Users/diaak/LDI/scRNASeq/data/cellranger_counts/cellranger_counts/GEXD/filtered_feature_bc_matrix")
+sce_data_IV_obj <- Seurat::CreateSeuratObject(sce_data_IV, min.cells=5, min.features=100, project = "GEXD")
+```
+
+We use seurat's merge function to combine seurat objects. This allows us to analyze scRNASeq data together. To determine which cells are damaged and which are dead, we calculate the percentage of mitochondrial readings and the number of genes per cell. Damaged cells generally have high mitochondrial readings, while dead cells have a low total number of genes detected. For human data, the genetic symbol for mitochondrial genes (i.e. genes in the mitochondrial genome) all begin with “MT-”. We use the PercentageFeatureSet function.
+
+```{r}
+# Create a merged Seurat object
+#library(SeuratData)
+
+merged_seurat <-  merge(sce_data_I_obj, y = c(sce_data_II_obj, sce_data_III_obj, sce_data_IV_obj), add.cell.id = c("GEXA", "GEXB", "GEXC", "GEXD"))
+# Add number of genes per UMI for each cell to metadata
+merged_seurat$GenesPerUMI <- merged_seurat$nFeature_RNA / merged_seurat$nCount_RNA
+# Compute percent mito ratio
+merged_seurat[["percent.mt"]] <- PercentageFeatureSet(merged_seurat, "^MT-")
+```
+
+We create a metadata to store the number of genes, the percentage of mitochondria and the sample variable containing the different samples (GEXA, GEXB, GEXC, GEXD). nUMI represents the number of UMI per cell and nGene the number of genes per cell.
+
+```{r}
+# Create metadata dataframe
+metadata <- merged_seurat@meta.data
+
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+        dplyr::rename(seq_folder = orig.ident,
+                      nUMI = nCount_RNA,
+                      nGene = nFeature_RNA)
+
+# Create sample column
+metadata$sample <- NA
+metadata$sample[which(str_detect(metadata$cells, "^GEXA_"))] <- "GEXA"
+metadata$sample[which(str_detect(metadata$cells, "^GEXB_"))] <- "GEXB"
+metadata$sample[which(str_detect(metadata$cells, "^GEXC_"))] <- "GEXC"
+metadata$sample[which(str_detect(metadata$cells, "^GEXD_"))] <- "GEXD"
+```
+
+```{r}
+# Add metadata back to Seurat object
+merged_seurat@meta.data <- metadata
+                           
+# Create .RData object to load at any time
+save(merged_seurat, file="data/merged_filtered_seurat.RData")
+```
+
+The number of cells per sample is displayed.
+
+```{r}
+# Visualize the number of cell counts per sample
+metadata %>% 
+  	ggplot(aes(x=sample, fill=sample)) + 
+  	geom_bar() +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+```
+
+```{r}
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  	ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 850)
+```
+
+We represent the number of UMI per cell. These representations enable us to identify the threshold for determining dead and damaged cells. We observe a peak centered around 1000 genes per cell, which seems to correspond to the majority of viable cells. Cells on the left of the distribution, with less than 500 genes, may represent dead or dying cells. These cells express a very small number of genes, which is typical of non-viable cells. A threshold of 500 genes per cell (nGene < 500) seems appropriate to exclude dead cells. This threshold makes it possible to capture viable cells while eliminating dead cells with low transcription.
+
+```{r}
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  	ggplot(aes(color=sample, x=nGene, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 500)
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  	ggplot(aes(x=sample, y=log10(nGene), fill=sample)) + 
+  	geom_boxplot() + 
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells vs NGenes")
+
+
+```
+
+The correlation between the number of UMIs and the number of genes is shown. The upper part represents viable cells.
+
+```{r warning=FALSE}
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=percent.mt)) + 
+  	geom_point() + 
+	scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 850) +
+  	geom_hline(yintercept = 500) +
+  	facet_wrap(~sample)
+```
+
+We visualize the distribution of mitochondrial expression of the genes detected per cell. There's a peak around 5%, with the distribution dropping rapidly above this threshold. A threshold of 5% mitochondrial percentage seems to be a good choice for filtering out damaged cells. Cells with a mitochondrial gene percentage above 5% are probably damaged, as an over-representation of mitochondrial genes is usually a sign of stress or cell death.
+
+```{r}
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>% 
+  	ggplot(aes(color=sample, x=percent.mt, fill=sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 5)
+```
+
+A new seurat object is created to filter only good-quality cells.
+
+```{r}
+# Filter out low quality reads using selected thresholds
+filtered_seurat <- subset(x = merged_seurat, 
+                         subset= (nUMI >= 850) & 
+                           (nGene >= 500) & 
+                           (percent.mt < 5))
+```
+
+```{r}
+save(filtered_seurat, file="data/filtered_seurat.RData")
+```
+
+Answers to questions
+
+1) The percentage of cells retained after removal of damaged and dead cells is 88% for sample GEXA, 89% for GEXB, 88% for GEXC and 90% for sample GEXD.
+
+```{r}
+metadata_filtered <-filtered_seurat@meta.data
+table(metadata_filtered$sample)/table(metadata$sample)
+```
+
+2) The total number of genes for samples GEXA, GEXB, GEXC, GEXD are as follows: GEXA: 4615879, GEXB: 4241144, GEXC: 4372799, GEXD: 3533517
+
+```{r}
+tapply(metadata_filtered$nGene, metadata_filtered$sample, sum)
+```
+
+3) The median number of genes per cell is: GEXA: 1326, GEXB: 1343, GEXC: 1164, GEXD: 968
+
+```{r}
+tapply(metadata_filtered$nGene, metadata_filtered$sample, median)
+```
+
+4) Dead cells have a very low total number of genes detected. Thus, in our analysis, the percentage of dead cells for sample GEXA is 2.14%, that for GEXB is 0.89%, that for GEXC is 6.6% and the percentage of dead cells for sample GEXD is 4.56%.
+
+```{r}
+(tapply(metadata["nGene"] < 500, metadata$sample, sum)/tapply(metadata["nGene"]>=0, metadata$sample, sum))*100
+```
+
+5) The median number of UMI Counts(transcript) per cell is shown in the following table: GEXA: 3373 GEXB: 3340 GEXC: 3142 GEXD: 2135
+
+```{r}
+tapply(metadata_filtered$nUMI, metadata_filtered$sample, median)
+```
+
+Now that we have data with viable cells, we move on to the processing steps prior to cell type identification. We use the SCTransform method to normalize and stabilize the variance of scRNA-seq data. The sctransform method models the UMI counts using a regularized negative binomial model to remove variation due to sequencing depth (total number of UMIs per cell), while adjusting the variance according to the pooling of information on genes with similar abundances (similar to some bulk RNA-seq methods).
+
+```{r warning=FALSE}
+# Split seurat object by sample to perform SCT on all samples
+split_seurat <- SplitObject(filtered_seurat, split.by = "sample")
+
+split_seurat <- split_seurat[c("GEXA", "GEXB", "GEXC", "GEXD")]
+
+for (i in 1:length(split_seurat)) {
+    split_seurat[[i]] <- NormalizeData(split_seurat[[i]], verbose = TRUE)
+    split_seurat[[i]] <- SCTransform(split_seurat[[i]], vars.to.regress = c("percent.mt"))
+    }
+```
+
+The other step consists in integrating the samples using highly variable shared genes to align cells from different samples if the cell types separate per sample. To perform the integration, we'll proceed in several steps. First, we select the most variable genes identified by SCT. Next, we need to prepare the SCTransform object for integration. We will now perform a CCA analysis, searching for the best anchors and filtering out incorrect anchors before integrating the various samples.
+
+```{r warning=FALSE}
+# Select the most variable features to use for integration
+integ_features <- SelectIntegrationFeatures(object.list = split_seurat, 
+                                            nfeatures = 3000) 
+
+# Prepare the SCT list object for integration
+split_seurat <- PrepSCTIntegration(object.list = split_seurat, 
+                                   anchor.features = integ_features)
+
+# Find best buddies 
+integ_anchors <- FindIntegrationAnchors(object.list = split_seurat, 
+                                        normalization.method = "SCT", 
+                                        anchor.features = integ_features)
+
+# Integrate across sample
+seurat_integrated <- IntegrateData(anchorset = integ_anchors, 
+                                   normalization.method = "SCT")
+```
+
+We can now perform UMAP visualization. We'll be using dimensionality reduction techniques such as PCA and Uniform Manifold Approximation and Projection (UMAP). For principal components, we use PCS =40. With SCTransform, the more PCs we choose, the more variation is taken into account when performing clustering. Therefore, for this analysis, we'll use the first 40 PCs to generate the clusters. We could have used the elbow method if we had taken the old normalization and variance stabilization methods.
+
+6) UMAP plot with embedding colored by sample
+
+```{r warning=FALSE}
+# Run PCA
+seurat_integrated <- RunPCA(object = seurat_integrated)
+# Run UMAP
+seurat_integrated <- RunUMAP(seurat_integrated, dims = 1:40, reduction = "pca")
+DimPlot(seurat_integrated, split.by = "sample")  
+```
+
+To cluster the cells, we use FindNeighbors(), which integrates the cells into a graphical structure, using a K-nearest neighbor (KNN) graph, and FindClusters, which performs graph-based clustering. We use a resolution between 0.4 and 1.4, which is appropriate for cells between 3000 and 5000.
+
+```{r warning=FALSE}
+# Determine the K-nearest neighbor graph
+seurat_integrated <- FindNeighbors(object = seurat_integrated, 
+                                dims = 1:40)
+                                
+# Determine the clusters for various resolutions                                
+seurat_integrated <- FindClusters(object = seurat_integrated,
+                               resolution = c(0.4, 0.6, 0.8, 1.0, 1.4))
+```
+
+```{r}
+# Assign identity of clusters
+Idents(object = seurat_integrated) <- "integrated_snn_res.0.8"
+```
+
+```{r}
+# Plot the UMAP
+DimPlot(seurat_integrated,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 6)
+```
+
+We continue with resolution 0.6.
+
+```{r}
+# Assign identity of clusters
+Idents(object = seurat_integrated) <- "integrated_snn_res.0.6"
+
+# Plot the UMAP
+DimPlot(seurat_integrated,
+        reduction = "umap", 
+        label = TRUE,
+        label.size = 6)
+```
+
+Samples are separated for better visualization.  
+7) UMAP plot with embedding colored by Louvain cluster
+
+```{r}
+GEXA <- subset(x = seurat_integrated, 
+                         subset= sample=='GEXA')
+DimPlot(GEXA, label = T , repel = T, label.size = 3) + ggtitle('UMAP GEXA')
+
+GEXB <- subset(x = seurat_integrated, 
+                         subset= sample=='GEXB')
+DimPlot(GEXB, label = T , repel = T, label.size = 3) + ggtitle('UMAP GEXB')
+
+GEXC <- subset(x = seurat_integrated, 
+                         subset= sample=='GEXC')
+DimPlot(GEXC, label = T , repel = T, label.size = 3) + ggtitle('UMAP GEXC')
+
+GEXD <- subset(x = seurat_integrated, 
+                         subset= sample=='GEXD')
+DimPlot(GEXD, label = T , repel = T, label.size = 3) + ggtitle('UMAP GEXD')
+```
+
+```{r}
+save(seurat_integrated, file="data/seurat_integrated.RData")
+```
+
+For cluster annotation we use the SingleR package. SingleR is a popular reference-based automatic cell type annotation tool used to predict cell identities from gene expression profiles. We use the pruned.labels column containing the most reliable cells to assign cell types to the cluster.
+
+```{r warning=FALSE}
+DefaultAssay(seurat_integrated) <- "RNA"
+seurat_integrated = JoinLayers(seurat_integrated)
+seurat_integrated_SCE = as.SingleCellExperiment(seurat_integrated)
+# 2. Get reference dataset
+ref <- celldex::HumanPrimaryCellAtlasData()
+results <- SingleR(test = seurat_integrated_SCE, ref = ref, labels = ref$label.main)
+
+# Add inferred cell type labels to seurat_integrated
+seurat_integrated$singlr_labels <- results$pruned.labels
+```
+
+We add the variable singlr_labels to seurat_integrated
+
+```{r warning=FALSE}
+seurat_integrated <- AddMetaData(seurat_integrated, seurat_integrated$singlr_labels, col.name = 'SingleR_HCA')
+# Visualise them on the UMAP
+seurat_integrated <- SetIdent(seurat_integrated, value = "SingleR_HCA")
+DimPlot(seurat_integrated, label = T , repel = T, label.size = 3) + NoLegend()
+```
+
+8) Annotate Louvain Clusters
+
+```{r}
+GEXA <- subset(x = seurat_integrated, 
+                         subset= sample=='GEXA')
+DimPlot(GEXA, label = T , repel = T, label.size = 3) + NoLegend() + ggtitle('UMAP GEXA')
+
+GEXB <- subset(x = seurat_integrated, 
+                         subset= sample=='GEXB')
+DimPlot(GEXB, label = T , repel = T, label.size = 3) + NoLegend() + ggtitle('UMAP GEXB')
+
+GEXC <- subset(x = seurat_integrated, 
+                         subset= sample=='GEXC')
+DimPlot(GEXC, label = T , repel = T, label.size = 3) + NoLegend() + ggtitle('UMAP GEXC')
+
+GEXD <- subset(x = seurat_integrated, 
+                         subset= sample=='GEXD')
+DimPlot(GEXD, label = T , repel = T, label.size = 3) + NoLegend() + ggtitle('UMAP GEXD')
+```
+
+
+9) violin plots showing expression levels for the following markers: PTPRC, CD3D, CD4, CD8A, GZMB, NKG7, GNLY, CD19, MS4A1 (CD20),
+CD79A, CD14, VCAN, LYZ, FCGR3A, IFITM3, AIF1, HLA-DRA, CDIC, GZMB, SERPINF1, IRF8, HBB, PF4
+
+```{r  warning=FALSE}
+# Vln plot - cluster
+VlnPlot(object = GEXA, 
+        features = c("PTPRC", "CD3D", "CD4", "CD8A", "GZMB", "NKG7", "GNLY", "CD19", "CD79A", "CD79A", "CD14", "VCAN", "LYZ", "FCGR3A", "IFITM3", "AIF1", "HLA-DRA", "CDIC", "GZMB", "SERPINF1", "IRF8", "HBB", "PF4"))
+```
+
+```{r warning=FALSE}
+
+VlnPlot(object = GEXB, 
+        features = c("PTPRC", "CD3D", "CD4", "CD8A", "GZMB", "NKG7", "GNLY", "CD19", "CD79A", "CD79A", "CD14", "VCAN", "LYZ", "FCGR3A", "IFITM3", "AIF1", "HLA-DRA", "CDIC", "GZMB", "SERPINF1", "IRF8", "HBB", "PF4"))
+```
+
+```{r warning=FALSE}
+VlnPlot(object = GEXC, 
+        features = c("PTPRC", "CD3D", "CD4", "CD8A", "GZMB", "NKG7", "GNLY", "CD19", "CD79A", "CD79A", "CD14", "VCAN", "LYZ", "FCGR3A", "IFITM3", "AIF1", "HLA-DRA", "CDIC", "GZMB", "SERPINF1", "IRF8", "HBB", "PF4"))
+```
+
+
+```{r warning=FALSE}
+VlnPlot(object = GEXD, 
+        features = c("PTPRC", "CD3D", "CD4", "CD8A", "GZMB", "NKG7", "GNLY", "CD19", "CD79A", "CD79A", "CD14", "VCAN"))
+```
+
+
+```{r warning=FALSE}
+VlnPlot(object = GEXD, 
+        features = c("VCAN", "LYZ", "FCGR3A", "IFITM3", "AIF1", "HLA-DRA", "CDIC", "GZMB", "SERPINF1", "IRF8", "HBB", "PF4"))
+```
+
+
+
+10) Cell proportions per cluster for aliquots I to IV
+```{r}
+# Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+n_cells <- FetchData(seurat_integrated, 
+                     vars = c("SingleR_HCA", "seq_folder")) %>%
+        dplyr::count(SingleR_HCA, seq_folder) %>%
+        tidyr::spread(SingleR_HCA, n)
+```
+
+```{r}
+dim(GEXA)[2]
+tcell <- as.data.frame(t(n_cells))
+# Define the first row as column names
+colnames(tcell) <- tcell[1, ]
+
+# Delete the first row
+tcell <- tcell[-1, ]
+tcell$GEXA = as.numeric(tcell$GEXA)
+tcell$GEXB = as.numeric(tcell$GEXB)
+tcell$GEXC = as.numeric(tcell$GEXC)
+tcell$GEXD = as.numeric(tcell$GEXD)
+```
+
+Cell proportions per cluster for aliquots I to IV
+```{r}
+tcell$perc_GEXA = round((tcell$GEXA/sum(tcell$GEXA, na.rm = TRUE))*100, 2)
+tcell$perc_GEXB = round((tcell$GEXB/sum(tcell$GEXB, na.rm = TRUE))*100, 2)
+tcell$perc_GEXC = round((tcell$GEXC/sum(tcell$GEXC, na.rm = TRUE))*100, 2)
+tcell$perc_GEXD = round((tcell$GEXD/sum(tcell$GEXD, na.rm = TRUE))*100, 2)
+cols <- c("perc_GEXA", "perc_GEXB", "perc_GEXC", "perc_GEXD")
+print(tcell[cols])
+```
+
+10.1) Method IV (processing after thawing without incubation, with low-speed centrifugation for dead cell removal) shows the highest cell recovery. This can be seen from the higher proportion of viable cells retained in GEXD:
+
+Percentage of dead cells: GEXD shows a lower percentage of dead cells compared to GEXC (method III), with 4.56% dead cells, while GEXC has 6.63%. When compared to GEXA and GEXB (methods with incubation), GEXD also performs well, with a relatively low percentage of dead cells.
+The total number of genes and the median number of genes per cell are lower in GEXD, which might suggest that although a higher proportion of cells were recovered, some of these cells might be of lower quality (e.g., damaged or dying cells that might have slipped through the filter).
+
+10.2) Method IV (processing after thawing without incubation, with low-speed centrifugation for dead cell removal) is also the best for retaining monocytes.
+
+Proportion of monocytes: GEXD shows the highest proportion of monocytes at 44.15%, followed by GEXC with 34.38%. Methods I and II (GEXA and GEXB) show much lower proportions of monocytes (8.43% in GEXA and 22.79% in GEXB).
+This suggests that method IV is optimal for retaining monocytes. It is possible that skipping the incubation step helps preserve this cell type, and that the low-speed centrifugation is gentler, limiting the loss of large or fragile cells like monocytes.
+
+Conclusion:
+Best cell recovery: Method IV (GEXD) appears to perform the best in terms of overall cell recovery.
+Best retention of monocytes: Method IV (GEXD) is also the most effective for monocyte retention, likely due to the absence of incubation and the gentler centrifugation procedure.
